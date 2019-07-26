@@ -1,0 +1,387 @@
+Grouped Failover, a 2008R2 version of Availability Groups
+
+ One of the new cool features in SQL 2012 is the SQL Server Availability groups. In other words being able to failover a group of databases which are logically connected. i.e. SharePoint databases. Well, it is also possible to do that in SQL 2008 (R2). It’s called a Grouped Failover. Instead of configuring it in SQL mirroring, you have to administrate the connected databases yourself and with a single stored procedure you will be able to failover a group of databases. It also gives you the option to failover a group of mirrored databases when the principal is down.
+How to implement this solution
+
+First run the script and it will create a database, 3 tables and a stored procedure. Of the 3 tables 2 of them need to be filled with configuration you desire or need. In the table tblFailoverGroups you create 1 or more failover groups. In the table tblFailoverGroupDatabases you need to add the databases that are linked to the failover group you just created. You can also add databases that are not mirrored, but have a logical connection to the failover group. These database will not failover since they are not mirrored.
+
+
+
+
+
+
+----------------------------------------------------------------
+-- Create grouped failover solution
+----------------------------------------------------------------
+-- Author:		Remko de Boer
+-- Email:		remko@bittown.nl
+-- Created:		16-01-2013
+-- Description:	The grouped failover solution is an solution that
+--				that empoweres the DBA to failover a number of databases
+--				which are logically linked to eachother i.e. sharepoint
+--				databases. The concept is based on 2 tables:
+--				tblFailoverGroups and tblFailoverGroupDatabases
+--				The tblFailoverGroups contains the group information en
+--				description. It is possible to have multiple groups on a
+--				single SQL Server Instance.
+--				The tblFailoverGroupDatabases contains all databases linked
+--				to a specific group. It is not possible for a database to be
+--				in more then 1 group. 
+--				It is possible to add databases to the group, even while these
+--				databases are not being mirrored.
+----------------------------------------------------------------
+-- Version:		1.0 Initial
+----------------------------------------------------------------
+-- Installation
+----------------------------------------------------------------
+-- Run this script, and after a succesfull execution check if 
+-- the following objects have been created:
+-- database		SQL_Beheer
+-- table		dbo.tblFailoverGroups
+-- table		dbo.tblFailoverGroupDatabases
+-- table		dbo.tblFailoverErrors
+-- procedure	dbo.spFailoverGroup
+-- If all these objects are installed correctly, 
+-- the solution then needs to configured by adding groups 
+-- and adding databases to these groups.
+-- After configguring the groups and databases the grouped failover
+-- can be executed by the use of spFailoverGroup.
+-- Check the inline documentation of the spFailoverGroup procedure
+-- to obtain the needed information on what values to use as parameters
+----------------------------------------------------------------
+
+
+-- Check if database already exsists ---------------------------
+if (select count(1) from sys.databases where name = 'SQL_Beheer') > 0
+	BEGIN
+		print 'database already exists.'
+	END
+else
+	begin
+		Create database SQL_Beheer
+
+		print 'database SQL_Beheer created.'
+	end
+----------------------------------------------------------------
+GO
+
+-- Switch to SQL_Beheer ----------------------------------------
+USE SQL_Beheer
+----------------------------------------------------------------
+GO
+
+-- check if tblFailoverGroups exists ---------------------------
+if (select count(1) from sys.tables where name = 'tblFailoverGroups') > 0
+	BEGIN
+		print 'table tblFailoverGroups already exists.'
+	END
+ELSE
+	BEGIN
+		CREATE TABLE [dbo].[tblFailoverGroups]
+		(
+			[id] [int] IDENTITY(1,1) NOT NULL,
+			[group_name] [varchar](250) NULL,
+			[group_description] [varchar](max) NULL
+		) ON [PRIMARY]
+
+		print 'table tblFailoverGroups created.'
+	END
+----------------------------------------------------------------
+GO
+
+-- check if tblFailoverGroupDatabases exists -------------------
+if (select count(1) from sys.tables where name = 'tblFailoverGroupDatabases') > 0
+	BEGIN
+		print 'table tblFailoverGroupDatabases already exists.'
+	END
+ELSE
+	BEGIN
+	CREATE TABLE [dbo].[tblFailoverGroupDatabases]
+		(
+		[id] [int] IDENTITY(1,1) NOT NULL,
+		[group_id] [int] NULL,
+		[database_name] [varchar](250) NULL,
+		[database_id] [int] NULL
+		) ON [PRIMARY]
+
+		print 'table tblFailoverGroupDatabases created.'
+	END
+----------------------------------------------------------------
+GO
+
+-- check if tblFailoverErrors exists ---------------------------
+if (select count(1) from sys.tables where name = 'tblFailoverErrors') > 0
+	BEGIN
+		print 'table tblFailoverErrors already exists.'
+	END
+ELSE
+	BEGIN
+		CREATE TABLE [dbo].[tblFailoverErrors]
+			(
+			[id] [int] IDENTITY(1,1) NOT NULL,
+			[group_id] [int] NULL,
+			[database_id] [int] NULL,
+			[error_date] [date] NULL,
+			[error_time] [time](7) NULL,
+			[error_message] [varchar](1000) NULL
+			) ON [PRIMARY]
+
+		print 'table tblFailoverErrors created.'
+	END
+----------------------------------------------------------------
+GO
+
+-- check if spFailoverGroup exists -----------------------------
+if (select count(1) from sys.procedures where name = 'spFailoverGroup') > 0
+	BEGIN
+		print 'procedure spFailoverGroup already exists'
+	END
+ELSE
+	BEGIN
+		declare @string nvarchar(max)
+
+		set @string = N''
+
+		set @string = @string + N'-----------------------------------------------------------------------' + char(13) + char(10)
+		set @string = @string + N'-- dbo.spFailoverGroup <@groupid> <@actionid>' + char(13) + char(10)
+		set @string = @string + N'-----------------------------------------------------------------------' + char(13) + char(10)
+		set @string = @string + N'-- Author:		Remko de Boer' + char(13) + char(10)
+		set @string = @string + N'-- Created:		16-01-2013' + char(13) + char(10)
+		set @string = @string + N'-- Description:	This procedure will failover mirrored databases as groups,' + char(13) + char(10)
+		set @string = @string + N'--				based on the entries in the tblFailoverGroups table and the' + char(13) + char(10)
+		set @string = @string + N'--				tblFailOverGroupDatabases table.' + char(13) + char(10)
+		set @string = @string + N'-----------------------------------------------------------------------' + char(13) + char(10)
+		set @string = @string + N'-- Parameters:	@groupid,' + char(13) + char(10)
+		set @string = @string + N'--				This is the id of the group which needs a failover.' + char(13) + char(10)
+		set @string = @string + N'--				@action id,' + char(13) + char(10)
+		set @string = @string + N'--				This switch gives the option to either do a normal' + char(13) + char(10)
+		set @string = @string + N'--				controlled failover without dataloss or an emergency' + char(13) + char(10)
+		set @string = @string + N'--				failover with possible dataloss. This emergency failover' + char(13) + char(10)
+		set @string = @string + N'--				is only needed when the principal is no longer operating' + char(13) + char(10)
+		set @string = @string + N'--				properly and there is no automated failover configgured.' + char(13) + char(10)
+		set @string = @string + N'--				Swith Options:' + char(13) + char(10)
+		set @string = @string + N'--				0 = Normal failover' + char(13) + char(10)
+		set @string = @string + N'--				1 = forced failover on mirror, principal not available' + char(13) + char(10)
+		set @string = @string + N'-----------------------------------------------------------------------' + char(13) + char(10)
+		set @string = @string + N'-- Version:		1.0 Initial Version' + char(13) + char(10)
+		set @string = @string + N'-----------------------------------------------------------------------' + char(13) + char(10)
+		set @string = @string + N' ' + char(13) + char(10)
+		set @string = @string + N'create proc spFailoverGroup' + char(13) + char(10)
+		set @string = @string + N'@groupid int,' + char(13) + char(10)
+		set @string = @string + N'@actionid int' + char(13) + char(10)
+		set @string = @string + N'AS' + char(13) + char(10)
+		set @string = @string + N' ' + char(13) + char(10)
+		set @string = @string + N'-- DEBUG --------------------------------------------------------------' + char(13) + char(10)
+		set @string = @string + N'--declare @groupid int' + char(13) + char(10)
+		set @string = @string + N'--declare @actionid int' + char(13) + char(10)
+		set @string = @string + N'' + char(13) + char(10)
+		set @string = @string + N'--set @groupid = 1' + char(13) + char(10)
+		set @string = @string + N'--set @actionid = 0' + char(13) + char(10)
+		set @string = @string + N'-----------------------------------------------------------------------' + char(13) + char(10)
+		set @string = @string + N' ' + char(13) + char(10)
+		set @string = @string + N' ' + char(13) + char(10)
+		set @string = @string + N'-----------------------------------------------------------------------' + char(13) + char(10)
+		set @string = @string + N'-- Database state:' + char(13) + char(10)
+		set @string = @string + N'-----------------------------------------------------------------------' + char(13) + char(10)
+		set @string = @string + N'-- 0 = ONLINE ' + char(13) + char(10)
+		set @string = @string + N'-- 1 = RESTORING' + char(13) + char(10)
+		set @string = @string + N'-- 2 = RECOVERING' + char(13) + char(10)
+		set @string = @string + N'-- 3 = RECOVERY_PENDING' + char(13) + char(10)
+		set @string = @string + N'-- 4 = SUSPECT' + char(13) + char(10)
+		set @string = @string + N'-- 5 = EMERGENCY' + char(13) + char(10)
+		set @string = @string + N'-- 6 = OFFLINE' + char(13) + char(10)
+		set @string = @string + N'-----------------------------------------------------------------------' + char(13) + char(10)
+		set @string = @string + N'-- Mirroring state:' + char(13) + char(10)
+		set @string = @string + N'-----------------------------------------------------------------------' + char(13) + char(10)
+		set @string = @string + N'-- 0 = Suspended' + char(13) + char(10)
+		set @string = @string + N'-- 1 = Disconnected from the other partner' + char(13) + char(10)
+		set @string = @string + N'-- 2 = Synchronizing ' + char(13) + char(10)
+		set @string = @string + N'-- 3 = Pending Failover' + char(13) + char(10)
+		set @string = @string + N'-- 4 = Synchronized' + char(13) + char(10)
+		set @string = @string + N'-- 5 = The partners are not synchronized. Failover is not possible now.' + char(13) + char(10)
+		set @string = @string + N'-- 6 = The partners are synchronized. Failover is potentially possible.' + char(13) + char(10)
+		set @string = @string + N'-----------------------------------------------------------------------' + char(13) + char(10)
+		set @string = @string + N'-- Mirroring Role:' + char(13) + char(10)
+		set @string = @string + N'-----------------------------------------------------------------------' + char(13) + char(10)
+		set @string = @string + N'-- 1 = Principal' + char(13) + char(10)
+		set @string = @string + N'-- 2 = Mirror' + char(13) + char(10)
+		set @string = @string + N'-- NULL = Database is inaccessible or is not mirrored. ' + char(13) + char(10)
+		set @string = @string + N'----------------------------------------------------------------------' + char(13) + char(10)
+		set @string = @string + N' ' + char(13) + char(10)
+		set @string = @string + N' ' + char(13) + char(10)
+		set @string = @string + N'-- Drop temp table(s) -------------------------------------------------' + char(13) + char(10)
+		set @string = @string + N'IF object_id(''tempdb..#worklist'') IS NOT NULL' + char(13) + char(10)
+		set @string = @string + N'BEGIN' + char(13) + char(10)
+		set @string = @string + N'   DROP TABLE #worklist' + char(13) + char(10)
+		set @string = @string + N'END' + char(13) + char(10)
+		set @string = @string + N'-----------------------------------------------------------------------' + char(13) + char(10)
+		set @string = @string + N' ' + char(13) + char(10)
+		set @string = @string + N' ' + char(13) + char(10)
+		set @string = @string + N'-- Create temp table(s) -----------------------------------------------' + char(13) + char(10)
+		set @string = @string + N'create table #worklist' + char(13) + char(10)
+		set @string = @string + N'(' + char(13) + char(10)
+		set @string = @string + N'id int identity (1,1) not null' + char(13) + char(10)
+		set @string = @string + N',database_id int null' + char(13) + char(10)
+		set @string = @string + N',database_name varchar(250) null' + char(13) + char(10)
+		set @string = @string + N')' + char(13) + char(10)
+		set @string = @string + N'-----------------------------------------------------------------------' + char(13) + char(10)
+		set @string = @string + N' ' + char(13) + char(10)
+		set @string = @string + N' ' + char(13) + char(10)
+		set @string = @string + N'-- Create worklist ----------------------------------------------------' + char(13) + char(10)
+		set @string = @string + N'insert into #worklist' + char(13) + char(10)
+		set @string = @string + N'(' + char(13) + char(10)
+		set @string = @string + N'database_id,' + char(13) + char(10)
+		set @string = @string + N'database_name' + char(13) + char(10)
+		set @string = @string + N')' + char(13) + char(10)
+		set @string = @string + N'select ' + char(13) + char(10)
+		set @string = @string + N'	database_id,' + char(13) + char(10)
+		set @string = @string + N'	database_name' + char(13) + char(10)
+		set @string = @string + N'from' + char(13) + char(10)
+		set @string = @string + N'	tblFailoverGroupDatabases' + char(13) + char(10)
+		set @string = @string + N'where' + char(13) + char(10)
+		set @string = @string + N'	group_id = @groupid' + char(13) + char(10)
+		set @string = @string + N'-----------------------------------------------------------------------' + char(13) + char(10)
+		set @string = @string + N' ' + char(13) + char(10)
+		set @string = @string + N' ' + char(13) + char(10)
+		set @string = @string + N'-- Declare Variables --------------------------------------------------' + char(13) + char(10)
+		set @string = @string + N'declare @database_name varchar(250) ' + char(13) + char(10)
+		set @string = @string + N'declare @database_id int' + char(13) + char(10)
+		set @string = @string + N'declare @database_status int' + char(13) + char(10)
+		set @string = @string + N'declare @database_role int' + char(13) + char(10)
+		set @string = @string + N'declare @mirror_status int' + char(13) + char(10)
+		set @string = @string + N'declare @error_message varchar(2000)' + char(13) + char(10)
+		set @string = @string + N'-----------------------------------------------------------------------' + char(13) + char(10)
+		set @string = @string + N' ' + char(13) + char(10)
+		set @string = @string + N'-- Create cursor ------------------------------------------------------' + char(13) + char(10)
+		set @string = @string + N'declare failover_worklist cursor for' + char(13) + char(10)
+		set @string = @string + N'select database_id, database_name from #worklist order by database_name' + char(13) + char(10)
+		set @string = @string + N' ' + char(13) + char(10)
+		set @string = @string + N'open failover_worklist' + char(13) + char(10)
+		set @string = @string + N' ' + char(13) + char(10)
+		set @string = @string + N'FETCH NEXT FROM failover_worklist' + char(13) + char(10)
+		set @string = @string + N'INTO @database_id, @database_name' + char(13) + char(10)
+		set @string = @string + N' ' + char(13) + char(10)
+		set @string = @string + N'-- Check @@FETCH_STATUS to see if there are any more rows to fetch.' + char(13) + char(10)
+		set @string = @string + N'WHILE @@FETCH_STATUS = 0' + char(13) + char(10)
+		set @string = @string + N'BEGIN' + char(13) + char(10)
+		set @string = @string + N'	-----------------------------------------------------------------' + char(13) + char(10)
+		set @string = @string + N'	-- check if normal failover needs to be ' + char(13) + char(10)
+		set @string = @string + N'	-----------------------------------------------------------------' + char(13) + char(10)
+		set @string = @string + N'	-- @actionid' + char(13) + char(10)
+		set @string = @string + N'	-----------------------------------------------------------------' + char(13) + char(10)
+		set @string = @string + N'	-- 0 = Normal Failover' + char(13) + char(10)
+		set @string = @string + N'	-- 1 = Emergency Mode ### Potential Dataloss when used ! ###' + char(13) + char(10)
+		set @string = @string + N'	-----------------------------------------------------------------' + char(13) + char(10)
+		set @string = @string + N'	if @actionid = 0 -- Normal Failover --' + char(13) + char(10)
+		set @string = @string + N'	BEGIN' + char(13) + char(10)
+		set @string = @string + N' ' + char(13) + char(10)
+		set @string = @string + N'		-----------------------------------------------------------------' + char(13) + char(10)
+		set @string = @string + N'		-- check if the database is mirrored' + char(13) + char(10)
+		set @string = @string + N'		-----------------------------------------------------------------' + char(13) + char(10)
+		set @string = @string + N'		-- 1	= Principal' + char(13) + char(10)
+		set @string = @string + N'		-- 2	= Mirror' + char(13) + char(10)
+		set @string = @string + N'		-- NULL = Database is inaccessible or is not mirrored.' + char(13) + char(10)
+		set @string = @string + N'		-----------------------------------------------------------------' + char(13) + char(10)
+		set @string = @string + N'		set @database_role = (select mirroring_role from sys.database_mirroring where database_id = @database_id)' + char(13) + char(10)
+		set @string = @string + N' ' + char(13) + char(10)
+		set @string = @string + N'		if @database_role is null' + char(13) + char(10)
+		set @string = @string + N'		BEGIN' + char(13) + char(10)
+		set @string = @string + N'				set @error_message = ''Database is not configured for mirroring''' + char(13) + char(10)
+		set @string = @string + N'		END ' + char(13) + char(10)
+		set @string = @string + N'		else' + char(13) + char(10)
+		set @string = @string + N'		BEGIN' + char(13) + char(10)
+		set @string = @string + N'				------------------------------------------------------------------' + char(13) + char(10)
+		set @string = @string + N'				-- check the mirroring state' + char(13) + char(10)
+		set @string = @string + N'				------------------------------------------------------------------' + char(13) + char(10)
+		set @string = @string + N'				-- 0 = Suspended' + char(13) + char(10)
+		set @string = @string + N'				-- 1 = Disconnected from the other partner' + char(13) + char(10)
+		set @string = @string + N'				-- 2 = Synchronizing ' + char(13) + char(10)
+		set @string = @string + N'				-- 3 = Pending Failover' + char(13) + char(10)
+		set @string = @string + N'				-- 4 = Synchronized' + char(13) + char(10)
+		set @string = @string + N'				-- 5 = The partners are not synchronized. Failover is not possible now.' + char(13) + char(10)
+		set @string = @string + N'				-- 6 = The partners are synchronized. Failover is potentially possible.' + char(13) + char(10)
+		set @string = @string + N'				-----------------------------------------------------------------------' + char(13) + char(10)
+		set @string = @string + N'				set @mirror_status = (select mirroring_state from sys.database_mirroring where database_id = @database_id)' + char(13) + char(10)
+		set @string = @string + N' ' + char(13) + char(10)
+		set @string = @string + N'				if @mirror_status = 4 or @mirror_status = 6' + char(13) + char(10)
+		set @string = @string + N'					BEGIN' + char(13) + char(10)
+		set @string = @string + N'						declare @string nvarchar(4000)' + char(13) + char(10)
+		set @string = @string + N' ' + char(13) + char(10)
+		set @string = @string + N'						set @string = N'''' ' + char(13) + char(10)
+		set @string = @string + N'						set @string = N''ALTER DATABASE '' + CAST(@database_name as varchar) + '' SET PARTNER FAILOVER''' + char(13) + char(10)
+		set @string = @string + N' ' + char(13) + char(10)
+		set @string = @string + N'						exec sp_executesql @string' + char(13) + char(10)
+		set @string = @string + N' ' + char(13) + char(10)
+		set @string = @string + N'						set @error_message = ''Manual failover executed.''' + char(13) + char(10)
+		set @string = @string + N'					END' + char(13) + char(10)
+		set @string = @string + N'				else' + char(13) + char(10)
+		set @string = @string + N'					BEGIN' + char(13) + char(10)
+		set @string = @string + N'						set @error_message = ''In current mirroring state a normal synchronised failover is not possible.''' + char(13) + char(10)
+		set @string = @string + N'					END' + char(13) + char(10)
+		set @string = @string + N'			END' + char(13) + char(10)
+		set @string = @string + N' ' + char(13) + char(10)
+		set @string = @string + N'	END' + char(13) + char(10)
+		set @string = @string + N' ' + char(13) + char(10)
+		set @string = @string + N'if @actionid = 1 -- EMERGENCY MODE --' + char(13) + char(10)
+		set @string = @string + N'	BEGIN' + char(13) + char(10)
+		set @string = @string + N' ' + char(13) + char(10)
+		set @string = @string + N'		-------------------------------------------------------------' + char(13) + char(10)
+		set @string = @string + N'		-- check the mirroring state' + char(13) + char(10)
+		set @string = @string + N'		-------------------------------------------------------------' + char(13) + char(10)
+		set @string = @string + N'		set @mirror_status = (select mirroring_state from sys.database_mirroring where database_id = @database_id)' + char(13) + char(10)
+		set @string = @string + N' ' + char(13) + char(10)
+		set @string = @string + N'		if @mirror_status <> 4' + char(13) + char(10)
+		set @string = @string + N'			BEGIN' + char(13) + char(10)
+		set @string = @string + N'				set @string = N''''' + char(13) + char(10)
+		set @string = @string + N'				set @string = N''ALTER DATABASE '' + CAST(@database_name as varchar) + '' SET PARTNER FORCE_SERVICE_ALLOW_DATA_LOSS''' + char(13) + char(10)
+		set @string = @string + N' ' + char(13) + char(10)
+		set @string = @string + N'				exec sp_executesql @string' + char(13) + char(10)
+		set @string = @string + N' ' + char(13) + char(10)
+		set @string = @string + N'				set @error_message = ''Forced failover with possible data loss. Principal was unavailable.''' + char(13) + char(10)
+		set @string = @string + N'			END' + char(13) + char(10)
+		set @string = @string + N'		else' + char(13) + char(10)
+		set @string = @string + N'			BEGIN' + char(13) + char(10)
+		set @string = @string + N'				set @error_message = ''In current mirroring state a normal synchronised failover is not possible.''' + char(13) + char(10)
+		set @string = @string + N'			END	' + char(13) + char(10)
+		set @string = @string + N'	END' + char(13) + char(10)
+		set @string = @string + N' ' + char(13) + char(10)
+		set @string = @string + N'---------------------------------------------------------------' + char(13) + char(10)
+		set @string = @string + N'-- Log error message to logging table' + char(13) + char(10)
+		set @string = @string + N'---------------------------------------------------------------' + char(13) + char(10)
+		set @string = @string + N' ' + char(13) + char(10)
+		set @string = @string + N'	INSERT INTO [dbo].[tblFailoverErrors]' + char(13) + char(10)
+		set @string = @string + N'	(' + char(13) + char(10)
+		set @string = @string + N'	[group_id]' + char(13) + char(10)
+		set @string = @string + N'	,[database_id]' + char(13) + char(10)
+		set @string = @string + N'	,[error_date]' + char(13) + char(10)
+		set @string = @string + N'	,[error_time]' + char(13) + char(10)
+		set @string = @string + N'	,[error_message]' + char(13) + char(10)
+		set @string = @string + N'	)' + char(13) + char(10)
+		set @string = @string + N'	VALUES' + char(13) + char(10)
+		set @string = @string + N'	(' + char(13) + char(10)
+		set @string = @string + N'@groupid' + char(13) + char(10)
+		set @string = @string + N'	,@database_id' + char(13) + char(10)
+		set @string = @string + N'	,convert(date,GETDATE(),120)' + char(13) + char(10)
+		set @string = @string + N'	,convert(time,getdate(),0)' + char(13) + char(10)
+		set @string = @string + N'	,@error_message' + char(13) + char(10)
+		set @string = @string + N'	)' + char(13) + char(10)
+		set @string = @string + N' ' + char(13) + char(10)
+		set @string = @string + N' ' + char(13) + char(10)
+		set @string = @string + N'	   FETCH NEXT FROM failover_worklist' + char(13) + char(10)
+		set @string = @string + N'	   INTO @database_id, @database_name' + char(13) + char(10)
+		set @string = @string + N'	END' + char(13) + char(10)
+		set @string = @string + N' ' + char(13) + char(10)
+		set @string = @string + N'CLOSE failover_worklist' + char(13) + char(10)
+		set @string = @string + N'	DEALLOCATE failover_worklist' + char(13) + char(10)
+
+		exec sp_executesql @string		
+
+	END
+----------------------------------------------------------------
+GO
+
+----------------------------------------------------------------
+-- End of Script
+----------------------------------------------------------------
+
+

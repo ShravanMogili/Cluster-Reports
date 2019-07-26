@@ -1,0 +1,25 @@
+--Cluster Information
+/*This script will display information about the instance(s) on your cluster. 
+Name of nodes, active node and drive letters of the resources. The script is compatible with sql server 2005/2008*/
+
+
+PRINT ' **** Cluster Information ****'
+PRINT ' '
+PRINT ' The following is information on the cluster you are connected'
+PRINT ' '
+PRINT '... Name of all nodes used and are part of this failover cluster'
+SELECT * FROM sys.dm_os_cluster_nodes 
+PRINT ' '
+
+PRINT '... Node which is the active '
+PRINT ' '
+SELECT SERVERPROPERTY('ComputerNamePhysicalNetBIOS') AS 'Active_Node'
+
+PRINT '... Node(s) which is the passive '
+SELECT NodeName  AS 'Passive_Node'
+FROM sys.dm_os_cluster_nodes
+WHERE NodeName NOT IN (
+SELECT SERVERPROPERTY('ComputerNamePhysicalNetBIOS'))
+PRINT ' '
+PRINT '... Drive letters that are part of the resourse group which contain the data and log files'
+SELECT * FROM sys.dm_io_cluster_shared_drives
